@@ -1,0 +1,678 @@
+# =========================
+# Imports and Dependencies
+# =========================
+import discord
+import os
+import json
+import asyncio
+import pytz
+import logging
+import sys
+import traceback
+import time
+from datetime import datetime, timedelta
+from discord.ext import commands, tasks
+from dateutil.parser import parse
+from dotenv import load_dotenv
+
+# =========================
+# Configuration & Constants
+# =========================
+load_dotenv()  # Load environment variables
+
+DEFAULT_TZ = 'UTC'
+EVENTS_FILE = 'events.json'
+MOD_ROLE = "Raid Organizer"
+MAX_SLOTS = 50  # Max slots per role
+ROLE_REQUIREMENTS = {
+    "Tank": "Avalonian Veteran",
+    "Healer": "Certified Healer"
+}
+
+# =========================
+# Logging Setup
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger()
+
+# =========================
+# Bot Initialization
+# =========================
+intents = discord.Intents.default()
+intents.messages = True
+intents.reactions = True
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# =========================
+# Data Storage
+# =========================
+event_creations = {}
+events = {}
+
+# =========================
+# Event Persistence Functions
+# =========================
+def load_events():
+    """
+    Loads events from the JSON file into the global 'events' dictionary.
+    Handles conversion of time strings to datetime objects and ensures
+    all user IDs are strings for consistency.
+    """
+    global events
+    try:
+        with open(EVENTS_FILE, 'r') as f:
+            raw_events = json.load(f)
+            events = {}
+            for event_id, event_data in raw_events.items():
+                try:
+                    # Add default channel_id for old events
+                    if 'channel_id' not in event_data:
+                        event_data['channel_id'] = None
+                        
+                    event_data['time'] = datetime.fromisoformat(event_data['time'])
+                    # Convert user IDs to strings
+                    event_data['creator'] = str(event_data.get('creator', ''))
+                    event_data['participants'] = {
+                        k: [str(p) for p in v] 
+                        for k, v in event_data.get('participants', {}).items()
+                    }
+                    event_data['waitlist'] = {
+                        k: [str(p) for p in v] 
+                        for k, v in event_data.get('waitlist', {}).items()
+                    }
+                    events[event_id] = event_data
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.error(f"Skipping invalid event {event_id}: {str(e)}")
+    except (FileNotFoundError, json.JSONDecodeError):
+        events = {}
+
+def save_events():
+    """
+    Saves the current 'events' dictionary to the JSON file.
+    Converts datetime objects to ISO format strings for serialization.
+    """
+    # Saves the current events dictionary to the JSON file
+    save_data = {}
+    for event_id, event in events.items():
+        try:
+            event_copy = event.copy()
+            if isinstance(event_copy['time'], datetime):
+                event_copy['time'] = event_copy['time'].isoformat()
+            else:
+                raise TypeError("Event time is not a datetime object")
+            save_data[event_id] = event_copy
+        except Exception as e:
+            logger.error(f"Error saving event {event_id}: {str(e)}")
+            continue
+
+    with open(EVENTS_FILE, 'w') as f:
+        json.dump(save_data, f, indent=4)
+
+# =========================
+# Event Creation Class
+# =========================
+class EventCreation:
+    """
+    Helper class to manage the state of an event being created interactively.
+    Stores all relevant event data in a dictionary.
+    """
+    # Helper class to manage the state of an event being created interactively
+    def __init__(self, channel_id, creator_id):
+        self.step = 0
+        self.data = {
+            "channel_id": channel_id,
+            "creator": str(creator_id),
+            "guild_id": None,
+            "name": "",
+            "time": None,
+            "timezone": DEFAULT_TZ,
+            "roles": {},
+            "message_id": None,
+            "participants": {},
+            "waitlist": {},
+            "reminders_sent": False
+        }
+
+# =========================
+# Utility Functions
+# =========================
+async def parse_emoji(emoji_str: str, guild: discord.Guild) -> tuple:
+    """
+    Parses an emoji string and returns a tuple (emoji_key, emoji_str).
+    Handles both custom and unicode emojis.
+    """
+    # Parses emoji input and returns a tuple (emoji_key, emoji_str)
+    if emoji_str.startswith('<:') and emoji_str.endswith('>'):
+        parts = emoji_str[2:-1].split(':')
+        if len(parts) == 2:
+            emoji_name, emoji_id = parts
+            emoji = discord.utils.get(guild.emojis, id=int(emoji_id))
+            if emoji:
+                return (f"{emoji_name}:{emoji_id}", str(emoji))
+    return (emoji_str, emoji_str)
+
+async def parse_time(time_str: str, timezone: str) -> datetime:
+    """
+    Parses a time string and timezone, returning a timezone-aware datetime object.
+    Returns None if parsing fails.
+    """
+    # Parses a time string and returns a timezone-aware datetime object
+    try:
+        tz = pytz.timezone(timezone)
+        naive_time = parse(time_str)
+        return tz.localize(naive_time)
+    except (pytz.UnknownTimeZoneError, ValueError):
+        return None
+
+async def check_role_requirements(member: discord.Member, role_name: str) -> bool:
+    """
+    Checks if a Discord member has the required role to sign up for a specific event role.
+    Returns True if no requirement or if the member has the required role.
+    """
+    # Checks if a member has the required Discord role for a signup
+    required_role = ROLE_REQUIREMENTS.get(role_name)
+    return not required_role or any(role.name == required_role for role in member.roles)
+
+# =========================
+# Interactive Event Creation Helpers
+# =========================
+async def ask_event_name(ctx, creation):
+    """Ask the user for the event name via DM."""
+    await ctx.author.send("**Event Creation**\nWhat's the name of the event?")
+    name_msg = await bot.wait_for(
+        'message', 
+        check=lambda m: m.author == ctx.author and isinstance(m.channel, discord.DMChannel),
+        timeout=120
+    )
+    creation.data['name'] = name_msg.content
+
+async def ask_event_time(ctx, creation):
+    """Ask the user for the event time via DM."""
+    await ctx.author.send("When is the event? (Format: `YYYY-MM-DD HH:MM TIMEZONE`)\nExample: `2023-12-25 20:00 EST`")
+    time_msg = await bot.wait_for(
+        'message',
+        check=lambda m: m.author == ctx.author,
+        timeout=120
+    )
+    try:
+        time_str, tz = time_msg.content.rsplit(' ', 1)
+        event_time = await parse_time(time_str, tz)
+        if not event_time:
+            raise ValueError
+        creation.data['time'] = event_time
+        creation.data['timezone'] = tz
+        return True
+    except Exception:
+        await ctx.author.send("Invalid time format! Please use: `YYYY-MM-DD HH:MM TIMEZONE`")
+        return False
+
+async def ask_event_roles(ctx, creation):
+    """Ask the user for event roles via DM."""
+    await ctx.author.send(
+        "**Set up roles** (one per line)\n"
+        "**Format:** `emoji Role Name:slots`\n"
+        "**Examples:**\n"
+        "🛡️ Tank:1\n"
+        "<:CustomEmoji:123456789> Healer:2\n"
+        "⚔️ DPS:5"
+    )
+    roles_msg = await bot.wait_for(
+        'message',
+        check=lambda m: m.author == ctx.author,
+        timeout=300
+    )
+    roles = {}
+    guild = bot.get_guild(creation.data['guild_id'])
+    for line_number, line in enumerate(roles_msg.content.split('\n'), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parts = line.split(' ', 1)
+            if len(parts) < 2:
+                raise ValueError("Invalid format")
+            emoji_input, rest = parts
+            role_name, slots = rest.rsplit(':', 1)
+            emoji_key, emoji_str = await parse_emoji(emoji_input.strip(), guild)
+            if not emoji_str:
+                raise ValueError("Invalid emoji")
+            role_name = role_name.strip()
+            if not role_name:
+                raise ValueError("Missing role name")
+            if not slots.strip().isdigit():
+                raise ValueError("Slots must be a number")
+            slots = int(slots)
+            if not 1 <= slots <= MAX_SLOTS:
+                raise ValueError(f"Slots must be 1-{MAX_SLOTS}")
+            roles[emoji_key] = {
+                "name": role_name,
+                "slots": slots,
+                "required_role": ROLE_REQUIREMENTS.get(role_name),
+                "emoji_str": emoji_str
+            }
+        except Exception as e:
+            await ctx.author.send(f"Error in line {line_number}: {str(e)}\n`{line}`")
+            continue
+    if not roles:
+        await ctx.author.send("No valid roles! Event creation cancelled.")
+        return None
+    creation.data['roles'] = roles
+    return roles
+
+# =========================
+# Command Definitions
+# =========================
+@bot.command(name='create_event')
+async def create_event(ctx: commands.Context):
+    """
+    Starts an interactive DM session with the user to create a new event.
+    Collects event name, time, roles, and posts the event embed in the channel.
+    """
+    creation = EventCreation(ctx.channel.id, ctx.author.id)
+    creation.data['guild_id'] = ctx.guild.id
+    try:
+        await ask_event_name(ctx, creation)
+        ok = await ask_event_time(ctx, creation)
+        if not ok:
+            return
+        roles = await ask_event_roles(ctx, creation)
+        if not roles:
+            return
+        embed = await create_event_embed(creation.data)
+        channel = bot.get_channel(creation.data['channel_id'])
+        try:
+            message = await channel.send(embed=embed)
+        except discord.Forbidden:
+            await ctx.author.send("❌ I don't have permissions to send messages in that channel!")
+            return
+        except discord.HTTPException as e:
+            await ctx.author.send(f"❌ Failed to create event: {str(e)}")
+            return
+        for role_data in creation.data['roles'].values():
+            try:
+                await message.add_reaction(role_data['emoji_str'])
+            except discord.Forbidden:
+                await ctx.author.send("❌ I need 'Add Reactions' permission to set up roles!")
+                await message.delete()
+                return
+        creation.data['message_id'] = message.id
+        events[str(message.id)] = creation.data
+        save_events()
+        await ctx.author.send("Event created successfully!")
+    except asyncio.TimeoutError:
+        await ctx.author.send("Event creation timed out. Please start over.")
+    finally:
+        event_creations.pop(ctx.author.id, None)
+
+@bot.command(name='edit_event_time')
+async def edit_event_time(ctx, event_id: str):
+    """
+    Allows the event creator or a moderator to edit the time of an existing event.
+    Notifies all participants and waitlisted users of the change.
+    """
+    if ctx.author.id not in event_creations and not any(role.name == MOD_ROLE for role in ctx.author.roles):
+        await ctx.send("You don't have permission to edit this event.", delete_after=15)
+        return
+
+    event = events.get(event_id)
+    if not event:
+        await ctx.send("Event not found.", delete_after=15)
+        return
+
+    if ctx.author.id == event['creator']:
+        await ctx.send("You cannot edit the event time as the creator. Please use the event management commands.", delete_after=15)
+        return
+
+    # Ask for new time
+    await ctx.send("What is the new time for the event? (Format: `YYYY-MM-DD HH:MM TIMEZONE`)")
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+    try:
+        new_time_msg = await bot.wait_for('message', check=check, timeout=120)
+    except asyncio.TimeoutError:
+        await ctx.send("You took too long! Please use the event management commands to edit the event.", delete_after=15)
+        return
+
+    try:
+        time_str, tz = new_time_msg.content.rsplit(' ', 1)
+        new_time = await parse_time(time_str, tz)
+        if not new_time:
+            raise ValueError
+        event['time'] = new_time
+        event['timezone'] = tz
+        event['reminders_sent'] = False  # Reset reminders
+        save_events()
+
+        # Notify participants and update message
+        channel = bot.get_channel(event['channel_id'])
+        await channel.send(f"⏰ The event time has been updated to {new_time.strftime('%Y-%m-%d %H:%M %Z')}! Participants have been notified.")
+        for participant_role, participants in event['participants'].items():
+            for user_id in participants:
+                user = await bot.fetch_user(user_id)
+                await user.send(f"⏰ The event time has been updated to {new_time.strftime('%Y-%m-%d %H:%M %Z')}!")
+        await update_event_message(event_id)
+    except Exception as e:
+        await ctx.send(f"Error updating event time: {str(e)}", delete_after=15)
+        logger.error(f"Error updating event time for {event_id}: {str(e)}")
+
+@bot.command(name='cancel_event')
+async def cancel_event(ctx, event_id: str):
+    """
+    Allows the event creator or a moderator to cancel an event.
+    Notifies all participants and removes the event message.
+    """
+    if ctx.author.id not in event_creations and not any(role.name == MOD_ROLE for role in ctx.author.roles):
+        await ctx.send("You don't have permission to cancel this event.", delete_after=15)
+        return
+
+    event = events.get(event_id)
+    if not event:
+        await ctx.send("Event not found.", delete_after=15)
+        return
+
+    # Confirm cancellation
+    await ctx.send("Are you sure you want to cancel this event? This action cannot be undone. (yes/no)")
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+    try:
+        confirm_msg = await bot.wait_for('message', check=check, timeout=30)
+        if confirm_msg.content.lower() != 'yes':
+            await ctx.send("Event cancellation aborted.", delete_after=15)
+            return
+    except asyncio.TimeoutError:
+        await ctx.send("You took too long! Event cancellation aborted.", delete_after=15)
+        return
+
+    # Cancel the event
+    channel = bot.get_channel(event['channel_id'])
+    message = await channel.fetch_message(event['message_id'])
+    await message.delete()
+    del events[event_id]
+    save_events()
+    await ctx.send("Event has been cancelled and the message has been deleted.", delete_after=15)
+
+@bot.command(name='raider-help', aliases=['raider-commands'])
+async def help_command(ctx):
+    """
+    Sends a help message listing all available commands and formatting guides.
+    """
+    help_message = (
+        "**Raider Commands Help**\n"
+        "Here are the commands you can use:\n\n"
+        "**Event Creation:**\n"
+        "!create_event - Start creating a new event\n\n"
+        "**Event Management:**\n"
+        "!edit_event_time <event_id> - Edit the time of an event (mod only)\n"
+        "!cancel_event <event_id> - Cancel an event (mod only)\n\n"
+        "**Info:**\n"
+        "!ping - Check bot latency\n"
+        "!raider-help - Show this help message\n\n"
+        "For detailed information on each command, please refer to the documentation."
+    )
+    await ctx.author.send(help_message)
+    await ctx.send("I've sent you a DM with the help information.", delete_after=15)
+
+# =========================
+# Reaction Add Helper Functions
+# =========================
+async def get_emoji_key(payload):
+    """Return the emoji key string for a payload."""
+    if payload.emoji.is_custom_emoji():
+        return f"{payload.emoji.name}:{payload.emoji.id}"
+    else:
+        return str(payload.emoji)
+
+async def get_member_and_message(payload):
+    """Fetch the member and message objects from a payload."""
+    guild = bot.get_guild(payload.guild_id)
+    member = await guild.fetch_member(payload.user_id)
+    channel = bot.get_channel(payload.channel_id)
+    message = await channel.fetch_message(payload.message_id)
+    return member, message
+
+async def already_signed_up(event, user_id_str):
+    """Check if the user is already signed up for any role in the event."""
+    for role_key in event['roles']:
+        if (user_id_str in event['participants'].get(role_key, []) or
+            user_id_str in event['waitlist'].get(role_key, [])):
+            return True
+    return False
+
+# =========================
+# Event Handlers
+# =========================
+@bot.event
+async def on_raw_reaction_add(payload):
+    """
+    Handles when a user adds a reaction to an event message.
+    Signs up the user for a role or adds them to the waitlist if the role is full.
+    Ensures users can only sign up for one role per event.
+    """
+    if payload.user_id == bot.user.id:
+        return
+
+    event_id = str(payload.message_id)
+    if event_id not in events:
+        return
+
+    event = events[event_id]
+    emoji_key = await get_emoji_key(payload)
+    if emoji_key not in event['roles']:
+        return
+
+    try:
+        member, message = await get_member_and_message(payload)
+    except discord.NotFound:
+        return
+
+    role_info = event['roles'][emoji_key]
+    participants = event['participants'].get(emoji_key, [])
+    waitlist = event['waitlist'].get(emoji_key, [])
+    user_id_str = str(payload.user_id)
+
+    # Only allow one signup per event
+    if await already_signed_up(event, user_id_str):
+        await message.remove_reaction(payload.emoji, member)
+        await member.send(f"⚠️ You can only sign up for **one role** per event!\nRemove your existing signup first to change roles.")
+        return
+
+    if user_id_str in participants:
+        await message.remove_reaction(payload.emoji, member)
+        await member.send(f"⚠️ You're already signed up as {role_info['name']}!")
+        return
+    if user_id_str in waitlist:
+        await message.remove_reaction(payload.emoji, member)
+        await member.send(f"⚠️ You're already in the waitlist for {role_info['name']}!")
+        return
+
+    # Check role requirements
+    if not await check_role_requirements(member, role_info['name']):
+        await message.remove_reaction(payload.emoji, member)
+        await member.send(f"❌ You need the {role_info['required_role']} role to sign up as {role_info['name']}!")
+        return
+
+    # Add to participants or waitlist
+    if len(participants) >= role_info['slots']:
+        event['waitlist'].setdefault(emoji_key, []).append(user_id_str)
+        await member.send(f"⏳ {role_info['name']} is full! You're position #{len(event['waitlist'][emoji_key])} in waitlist.")
+    else:
+        event['participants'].setdefault(emoji_key, []).append(user_id_str)
+        await member.send(f"✅ Successfully signed up as {role_info['name']}!")
+
+    save_events()
+    await update_event_message(event_id)
+
+# =========================
+# Embed and Message Helpers
+# =========================
+TIME_FORMAT_EXAMPLE = "2023-12-25 20:00 EST"
+
+async def create_event_embed(event_data):
+    """
+    Creates and returns a Discord embed object representing the event,
+    including roles, participants, waitlist, and time information.
+    """
+    # Creates a Discord embed for an event
+    embed = discord.Embed(title=event_data['name'], color=0x00ff00)
+    event_time = event_data['time'].astimezone(pytz.timezone(event_data['timezone']))
+    utc_time = event_time.astimezone(pytz.utc)
+    
+    embed.add_field(
+        name="Event Time",
+        value=f"{event_time.strftime('%Y-%m-%d %H:%M %Z')}\n(UTC: {utc_time.strftime('%Y-%m-%d %H:%M')})",
+        inline=False
+    )
+    
+    for emoji_key, role in event_data['roles'].items():
+        participants = event_data['participants'].get(emoji_key, [])
+        waitlist = event_data['waitlist'].get(emoji_key, [])
+        
+        participant_list = '\n'.join([f"<@{p}>" for p in participants]) or "None"
+        waitlist_list = '\n'.join([f"<@{p}>" for p in waitlist[:3]]) 
+        if len(waitlist) > 3:
+            waitlist_list += f"\n+{len(waitlist)-3} more..."
+        
+        embed.add_field(
+            name=f"{role['emoji_str']} {role['name']} ({len(participants)}/{role['slots']})",
+            value=f"**Participants:**\n{participant_list}\n**Waitlist:**\n{waitlist_list or 'None'}",
+            inline=True
+        )
+    
+    if any(role['required_role'] for role in event_data['roles'].values()):
+        req_roles = [role['required_role'] for role in event_data['roles'].values() if role['required_role']]
+        embed.set_footer(text=f"Required roles: {', '.join(set(req_roles))}")
+    
+    return embed
+
+async def update_event_message(event_id):
+    """
+    Updates the event message embed in the channel to reflect the latest event state.
+    """
+    event = events[event_id]
+    channel = bot.get_channel(event['channel_id'])
+    try:
+        message = await channel.fetch_message(event['message_id'])
+        await message.edit(embed=await create_event_embed(event))
+    except (discord.NotFound, discord.Forbidden) as e:
+        logger.error(f"Error updating event message {event_id}: {str(e)}")
+
+# =========================
+# Bot Event Loop
+# =========================
+@bot.event
+async def on_ready():
+    """
+    Called when the bot is ready and connected to Discord.
+    Loads events from disk and starts the reminder loop.
+    """
+    # Called when the bot is ready and connected
+    logger.info(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
+    logger.info(f'Connected to {len(bot.guilds)} servers')
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.watching,
+        name="!raider-help for commands"
+    ))
+    load_events()
+    check_reminders.start()
+    logger.info("Bot is ready!")
+
+@tasks.loop(minutes=5)
+async def check_reminders():
+    """
+    Periodically checks for events starting within an hour and sends reminders to participants.
+    """
+    # Periodically checks for events starting soon and sends reminders
+    now = datetime.now(pytz.utc)
+    for event_id, event in list(events.items()):
+        if event['reminders_sent'] or event['time'] < now:
+            continue
+        
+        if (event['time'] - timedelta(hours=1)) < now < event['time']:
+            try:
+                channel = bot.get_channel(event['channel_id'])
+                mentions = []
+                for participants in event['participants'].values():
+                    mentions.extend([f"<@{p}>" for p in participants])
+                
+                await channel.send(
+                    f"**Reminder: {event['name']} starts in 1 hour!**\n"
+                    f"Participants: {' '.join(set(mentions))}"
+                )
+                event['reminders_sent'] = True
+                save_events()
+            except Exception as e:
+                logger.error(f"Error sending reminder for event {event_id}: {str(e)}")
+
+# =========================
+# Error Handling
+# =========================
+@bot.event
+async def on_error(event, *args, **kwargs):
+    """
+    Global error handler for uncaught exceptions in event handlers.
+    Logs the error and stack trace.
+    """
+    # Global error handler for uncaught exceptions
+    logger.error(f"Error in {event}: {sys.exc_info()[0]}")
+    logger.error(traceback.format_exc())
+
+@bot.event
+async def on_command_error(ctx, error):
+    """
+    Handles errors that occur during command execution.
+    Ignores unknown commands and logs others.
+    """
+    # Handles errors in command execution
+    if isinstance(error, commands.CommandNotFound):
+        return
+    logger.error(f"Command error: {error}")
+    await ctx.send(f"❌ Error executing command: {str(error)}", delete_after=15)
+
+# =========================
+# Owner Commands
+# =========================
+@bot.command(name='restart')
+@commands.is_owner()
+async def restart(ctx):
+    """
+    Restarts the bot. Owner only.
+    """
+    await ctx.send("Restarting bot...")
+    await bot.logout()
+    os.execv(sys.executable, ['python'] + sys.argv)
+
+@bot.command(name='ping')
+async def ping(ctx):
+    """
+    Responds with the bot's latency in milliseconds.
+    """
+    latency = round(bot.latency * 1000, 2)
+    await ctx.send(f"Pong! Latency: {latency}ms")
+
+# =========================
+# Main Entry Point
+# =========================
+if __name__ == "__main__":
+    """
+    Main entry point: starts the bot with auto-restart on crash.
+    """
+    # Start the bot with auto-restart
+    while True:
+        try:
+            bot.run(os.getenv('DISCORD_TOKEN'))
+            logger.info("Bot exited normally. Restarting in 10 seconds...")
+        except Exception as e:
+            logger.error(f"Bot crashed: {str(e)}")
+            logger.error(traceback.format_exc())
+            logger.info("Restarting in 10 seconds...")
+        time.sleep(10)
