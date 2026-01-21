@@ -15,7 +15,7 @@ This is a Discord bot for creating and managing event signups with role-based re
 
 ### **1. Prerequisites**
 ```bash
-pip install discord.py pytz python-dateutil python-dotenv
+python -m pip install discord.py pytz python-dateutil python-dotenv
 ```
 
 ### **2. Create Discord Application**
